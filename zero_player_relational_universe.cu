@@ -1,15 +1,3 @@
-// zero_player_meta_relational_universe.cu
-// ============================================================
-// CUDA + OpenGL interop zero player meta relational universe
-//
-// Fixes applied
-// 1) Correct directional probabilities: p(i->j) uses S_ij and p(j->i) uses S_ji
-//    Also symmetrize the integrated S and Sd using averages to kill any drift.
-// 2) Stop point flashing: render points without depth testing and without depth writes,
-//    and use non additive alpha blending for points.
-// 3) Enable program point size so gl_PointSize from the vertex shader is respected.
-// ============================================================
-
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -17,22 +5,15 @@
 #include <string>
 #include <sstream>
 
-// GLEW first
 #include <GL/glew.h>
-// GLFW next
 #include <GLFW/glfw3.h>
-// CUDA after OpenGL headers
+
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 
-// GLM
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
-
-// ============================================================
-// Error checking
-// ============================================================
 
 #define CUDA_CHECK(call) do { \
     cudaError_t _e = (call); \
@@ -62,10 +43,6 @@ static const char* glErrToStr(GLenum err) {
     } \
 } while(0)
 
-// ============================================================
-// Simulation config
-// ============================================================
-
 static int gWidth  = 1280;
 static int gHeight = 720;
 
@@ -74,43 +51,34 @@ static const int E = (N * (N - 1)) / 2;
 
 static const float DT = 0.010f;
 
-// Meta relation parameters
-static const float K_META     = 3.25f;
-static const float DAMP_S     = 0.65f;
 static const float K_MEMORY   = 1.35f;
 static const float GAMMA_META = 2.20f;
 
-// Geometry coupling
-static const float GAMMA_GEO  = 10.0f;
 static const float ETA_REP    = 0.025f;
 static const float DELTA_REP  = 0.020f;
-static const float DAMP_X     = 0.20f;
 
-// Gauge fixing
 static const float K_CM       = 2.00f;
 static const float K_SCALE    = 6.50f;
 static const float TARGET_RMS = 1.15f;
 
-// Anisotropic masses
 static const float M_X = 1.0f;
 static const float M_Y = 6.0f;
 static const float M_Z = 18.0f;
 
-// Numeric safety for exp(S)
-static const float S_MIN = -12.0f;
-static const float S_MAX =  4.0f;
+static const float M_S = 1.0f;
 
-static const float EPS = 1e-12f;
+static const float DAMP_X = 0.20f;
+static const float DAMP_S = 0.65f;
 
-// Render tuning
+static const float K_SYM = 14.0f;
+static const float K_ROW = 1.25f;
+
+static const float EPS = 1e-20f;
+
 static const float EDGE_ALPHA_MAX  = 0.85f;
 static const float EDGE_ALPHA_GAIN = 2.60f;
 
 static const float ACTION_GAIN     = 2.80f;
-
-// ============================================================
-// Camera and input
-// ============================================================
 
 static glm::vec3 cameraPos   = glm::vec3(0.0f, 0.0f, 6.0f);
 static glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
@@ -181,6 +149,7 @@ static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) 
 }
 
 static void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    (void)window;
     (void)scancode;
     (void)mods;
 
@@ -208,10 +177,6 @@ static void processInput(float dt) {
     if (keys[GLFW_KEY_E]) cameraPos += speed * cameraUp;
 }
 
-// ============================================================
-// CUDA OpenGL interop
-// ============================================================
-
 struct Vertex {
     float px, py, pz;
     float cr, cg, cb, ca;
@@ -219,10 +184,6 @@ struct Vertex {
 
 static cudaGraphicsResource_t cudaVboPoints = nullptr;
 static cudaGraphicsResource_t cudaVboLines  = nullptr;
-
-// ============================================================
-// OpenGL shader helpers
-// ============================================================
 
 static GLuint compileShader(GLenum type, const char* src) {
     GLuint sh = glCreateShader(type);
@@ -257,21 +218,8 @@ static GLuint linkProgram(GLuint vs, GLuint fs) {
     return prog;
 }
 
-// ============================================================
-// CUDA device helpers
-// ============================================================
-
 __device__ __forceinline__ float clampf(float x, float a, float b) {
     return fminf(fmaxf(x, a), b);
-}
-
-__device__ __forceinline__ float safeExp(float x) {
-    x = clampf(x, S_MIN, S_MAX);
-    return expf(x);
-}
-
-__device__ __forceinline__ float safeLog(float x) {
-    return logf(fmaxf(x, EPS));
 }
 
 __device__ __forceinline__ void atomicAdd3(float* fx, float* fy, float* fz, float ax, float ay, float az) {
@@ -286,24 +234,20 @@ __device__ __forceinline__ void hsv2rgb(float h, float s, float v, float& r, flo
     float x = c * (1.0f - fabsf(fmodf(h * 6.0f, 2.0f) - 1.0f));
     float m = v - c;
 
-    float rp=0, gp=0, bp=0;
+    float rp=0.0f, gp=0.0f, bp=0.0f;
     float hp = h * 6.0f;
 
-    if (hp < 1.0f)      { rp=c; gp=x; bp=0; }
-    else if (hp < 2.0f) { rp=x; gp=c; bp=0; }
-    else if (hp < 3.0f) { rp=0; gp=c; bp=x; }
-    else if (hp < 4.0f) { rp=0; gp=x; bp=c; }
-    else if (hp < 5.0f) { rp=x; gp=0; bp=c; }
-    else                { rp=c; gp=0; bp=x; }
+    if (hp < 1.0f)      { rp=c; gp=x; bp=0.0f; }
+    else if (hp < 2.0f) { rp=x; gp=c; bp=0.0f; }
+    else if (hp < 3.0f) { rp=0.0f; gp=c; bp=x; }
+    else if (hp < 4.0f) { rp=0.0f; gp=x; bp=c; }
+    else if (hp < 5.0f) { rp=x; gp=0.0f; bp=c; }
+    else                { rp=c; gp=0.0f; bp=x; }
 
     r = rp + m;
     g = gp + m;
     b = bp + m;
 }
-
-// ============================================================
-// Kernels
-// ============================================================
 
 __global__ void zero_array(float* a, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -311,27 +255,52 @@ __global__ void zero_array(float* a, int n) {
     a[i] = 0.0f;
 }
 
-__global__ void compute_row_sum_exp(const float* S, float* sumExp) {
+__global__ void compute_row_stats_S(const float* S, float* rowMaxS, float* rowLogSumExpS) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    float s = 0.0f;
+    float mx = -1.0e30f;
     int base = i * N;
     for (int j = 0; j < N; ++j) {
         if (j == i) continue;
-        s += safeExp(S[base + j]);
+        float v = S[base + j];
+        mx = fmaxf(mx, v);
     }
-    sumExp[i] = fmaxf(s, EPS);
+
+    float sum = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        if (j == i) continue;
+        float v = S[base + j];
+        sum += expf(v - mx);
+    }
+    sum = fmaxf(sum, EPS);
+
+    rowMaxS[i] = mx;
+    rowLogSumExpS[i] = logf(sum);
 }
 
-__global__ void compute_row_sum_target(const float* S, const float* X, const float* sumExp, float* sumTarget) {
+__global__ void compute_row_mean_S(const float* S, float* rowMeanS) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    int base = i * N;
+    float s = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        if (j == i) continue;
+        s += S[base + j];
+    }
+    rowMeanS[i] = s / (float)(N - 1);
+}
+
+__global__ void compute_row_stats_T(const float* S, const float* X, const float* rowMaxS, const float* rowLogSumExpS, float* rowMaxT, float* rowLogSumExpT) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
     float xi = X[i*3+0], yi = X[i*3+1], zi = X[i*3+2];
-    float Zi = sumExp[i];
+    float maxS = rowMaxS[i];
+    float logSumS = rowLogSumExpS[i];
 
-    float st = 0.0f;
+    float mx = -1.0e30f;
     int base = i * N;
 
     for (int j = 0; j < N; ++j) {
@@ -342,27 +311,65 @@ __global__ void compute_row_sum_target(const float* S, const float* X, const flo
         float dz = zi - zj;
         float dist2 = dx*dx + dy*dy + dz*dz;
 
-        float pij = safeExp(S[base + j]) / Zi;
-        float Tij = K_MEMORY * safeLog(pij) - GAMMA_META * dist2;
-        st += expf(Tij);
+        float logP = (S[base + j] - maxS) - logSumS;
+        float Tij = K_MEMORY * logP - GAMMA_META * dist2;
+        mx = fmaxf(mx, Tij);
     }
 
-    sumTarget[i] = fmaxf(st, EPS);
+    float sum = 0.0f;
+    for (int j = 0; j < N; ++j) {
+        if (j == i) continue;
+        float xj = X[j*3+0], yj = X[j*3+1], zj = X[j*3+2];
+        float dx = xi - xj;
+        float dy = yi - yj;
+        float dz = zi - zj;
+        float dist2 = dx*dx + dy*dy + dz*dz;
+
+        float logP = (S[base + j] - maxS) - logSumS;
+        float Tij = K_MEMORY * logP - GAMMA_META * dist2;
+        sum += expf(Tij - mx);
+    }
+    sum = fmaxf(sum, EPS);
+
+    rowMaxT[i] = mx;
+    rowLogSumExpT[i] = logf(sum);
 }
 
-__global__ void compute_entropy(const float* S, const float* sumExp, float* entropy) {
+__global__ void compute_row_kl_entropy(const float* S, const float* X, const float* rowMaxS, const float* rowLogSumExpS, const float* rowMaxT, const float* rowLogSumExpT, float* rowKL, float* rowEntropy) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    float Zi = sumExp[i];
-    float H = 0.0f;
+    float xi = X[i*3+0], yi = X[i*3+1], zi = X[i*3+2];
+    float maxS = rowMaxS[i];
+    float logSumS = rowLogSumExpS[i];
+    float maxT = rowMaxT[i];
+    float logSumT = rowLogSumExpT[i];
+
     int base = i * N;
+    float KL = 0.0f;
+    float H = 0.0f;
+
     for (int j = 0; j < N; ++j) {
         if (j == i) continue;
-        float pij = safeExp(S[base + j]) / Zi;
-        H += -pij * safeLog(pij);
+
+        float xj = X[j*3+0], yj = X[j*3+1], zj = X[j*3+2];
+        float dx = xi - xj;
+        float dy = yi - yj;
+        float dz = zi - zj;
+        float dist2 = dx*dx + dy*dy + dz*dz;
+
+        float logP = (S[base + j] - maxS) - logSumS;
+        float P = expf(logP);
+
+        float T = K_MEMORY * logP - GAMMA_META * dist2;
+        float logQ = (T - maxT) - logSumT;
+
+        KL += P * (logP - logQ);
+        H  += -P * logP;
     }
-    entropy[i] = H;
+
+    rowKL[i] = fmaxf(KL, 0.0f);
+    rowEntropy[i] = fmaxf(H, 0.0f);
 }
 
 __global__ void reduce_cm_r2(const float* X, float* outCM, float* outR2) {
@@ -408,13 +415,38 @@ __global__ void reduce_cm_r2(const float* X, float* outCM, float* outR2) {
     }
 }
 
-__global__ void meta_update_and_forces(
-    float* S, float* Sd,
+__global__ void apply_gauge_forces_X(const float* X, float* FX, const float* CM, const float* sumR2) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float cmx = CM[0] / (float)N;
+    float cmy = CM[1] / (float)N;
+    float cmz = CM[2] / (float)N;
+
+    float meanR2 = sumR2[0] / (float)N;
+    float scaleErr = meanR2 - (TARGET_RMS * TARGET_RMS);
+    float scaleCoef = -K_SCALE * scaleErr * (2.0f / (float)N);
+
+    float x = X[i*3+0];
+    float y = X[i*3+1];
+    float z = X[i*3+2];
+
+    FX[i*3+0] += -K_CM * cmx + scaleCoef * x;
+    FX[i*3+1] += -K_CM * cmy + scaleCoef * y;
+    FX[i*3+2] += -K_CM * cmz + scaleCoef * z;
+}
+
+__global__ void compute_edge_forces(
+    const float* S,
     const float* X,
+    const float* rowMaxS,
+    const float* rowLogSumExpS,
+    const float* rowMaxT,
+    const float* rowLogSumExpT,
+    const float* rowMeanS,
+    const float* rowKL,
     float* FX,
-    const float* sumExp,
-    const float* sumTarget,
-    float* action,
+    float* FS,
     const int* edgeU,
     const int* edgeV
 ) {
@@ -433,61 +465,49 @@ __global__ void meta_update_and_forces(
     float dx = xi - xj;
     float dy = yi - yj;
     float dz = zi - zj;
+    float dist2 = dx*dx + dy*dy + dz*dz;
 
-    float dist2 = dx*dx + dy*dy + dz*dz + 1e-12f;
+    float logPij = (S[ij] - rowMaxS[i]) - rowLogSumExpS[i];
+    float logPji = (S[ji] - rowMaxS[j]) - rowLogSumExpS[j];
 
-    float Zi = sumExp[i];
-    float Zj = sumExp[j];
+    float Pij = expf(logPij);
+    float Pji = expf(logPji);
 
-    // Use each direction's logit for each direction's probability
-    float expSij = safeExp(S[ij]);
-    float expSji = safeExp(S[ji]);
+    float Tij = K_MEMORY * logPij - GAMMA_META * dist2;
+    float Tji = K_MEMORY * logPji - GAMMA_META * dist2;
 
-    float pij = expSij / Zi;
-    float pji = expSji / Zj;
+    float logQij = (Tij - rowMaxT[i]) - rowLogSumExpT[i];
+    float logQji = (Tji - rowMaxT[j]) - rowLogSumExpT[j];
 
-    float Ti_j = K_MEMORY * safeLog(pij) - GAMMA_META * dist2;
-    float Tj_i = K_MEMORY * safeLog(pji) - GAMMA_META * dist2;
+    float Qij = expf(logQij);
+    float Qji = expf(logQji);
 
-    float qi_j = expf(Ti_j) / (sumTarget[i] + EPS);
-    float qj_i = expf(Tj_i) / (sumTarget[j] + EPS);
+    float Aij = logPij - logQij;
+    float Aji = logPji - logQji;
 
-    float logpij = safeLog(pij);
-    float logpji = safeLog(pji);
-    float logqij = safeLog(qi_j);
-    float logqji = safeLog(qj_i);
+    float Vi = rowKL[i];
+    float Vj = rowKL[j];
 
-    float deltaLog = 0.5f * ((logqij - logpij) + (logqji - logpji));
+    float dVdSij = Pij * (Aij - Vi) + K_MEMORY * (Qij - Pij);
+    float dVdSji = Pji * (Aji - Vj) + K_MEMORY * (Qji - Pji);
 
-    // Symmetrize state before integrating to suppress any drift
-    float Sd_cur = 0.5f * (Sd[ij] + Sd[ji]);
-    float S_cur  = 0.5f * (S[ij]  + S[ji]);
+    float sym = S[ij] - S[ji];
 
-    float accS = K_META * deltaLog - DAMP_S * Sd_cur;
+    float rowFix_i = -K_ROW * (rowMeanS[i] / (float)(N - 1));
+    float rowFix_j = -K_ROW * (rowMeanS[j] / (float)(N - 1));
 
-    float Sd_new = Sd_cur + accS * DT;
-    float S_new  = S_cur  + Sd_new * DT;
+    float Fij = -dVdSij - K_SYM * sym + rowFix_i;
+    float Fji = -dVdSji + K_SYM * sym + rowFix_j;
 
-    S_new = clampf(S_new, S_MIN, S_MAX);
+    FS[ij] = Fij;
+    FS[ji] = Fji;
 
-    Sd[ij] = Sd_new;
-    Sd[ji] = Sd_new;
-    S[ij]  = S_new;
-    S[ji]  = S_new;
+    float coefMeta = 2.0f * GAMMA_META * ((Qij - Pij) + (Qji - Pji));
+    float fx = coefMeta * dx;
+    float fy = coefMeta * dy;
+    float fz = coefMeta * dz;
 
-    // Action density accumulation (directed KL row contributions)
-    atomicAdd(&action[i], pij * (logpij - logqij));
-    atomicAdd(&action[j], pji * (logpji - logqji));
-
-    // Geometry forces weighted by symmetric relation weight
-    float w = 0.5f * (pij + pji);
-
-    float fx = -GAMMA_GEO * w * dx;
-    float fy = -GAMMA_GEO * w * dy;
-    float fz = -GAMMA_GEO * w * dz;
-
-    // Repulsion
-    float denom = (dist2 + DELTA_REP);
+    float denom = dist2 + DELTA_REP;
     float repScale = ETA_REP / (denom * denom);
     fx += repScale * dx;
     fy += repScale * dy;
@@ -497,59 +517,21 @@ __global__ void meta_update_and_forces(
     atomicAdd3(&FX[j*3+0], &FX[j*3+1], &FX[j*3+2], -fx, -fy, -fz);
 }
 
-__global__ void integrate_X(
-    float* X, float* V,
-    const float* FX,
-    const float* CM,
-    const float* sumR2
-) {
+__global__ void integrate_half_X(float* X, float* V, const float* FX) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
-
-    float cmx = CM[0] / (float)N;
-    float cmy = CM[1] / (float)N;
-    float cmz = CM[2] / (float)N;
-
-    float meanR2 = sumR2[0] / (float)N;
-    float scaleErr = meanR2 - (TARGET_RMS * TARGET_RMS);
-
-    float x = X[i*3+0];
-    float y = X[i*3+1];
-    float z = X[i*3+2];
-
-    float fx = FX[i*3+0];
-    float fy = FX[i*3+1];
-    float fz = FX[i*3+2];
-
-    // Gauge fixing
-    fx += -K_CM * cmx;
-    fy += -K_CM * cmy;
-    fz += -K_CM * cmz;
-
-    float scaleCoef = -K_SCALE * scaleErr * (2.0f / (float)N);
-    fx += scaleCoef * x;
-    fy += scaleCoef * y;
-    fz += scaleCoef * z;
-
-    float ax = fx / M_X;
-    float ay = fy / M_Y;
-    float az = fz / M_Z;
 
     float vx = V[i*3+0];
     float vy = V[i*3+1];
     float vz = V[i*3+2];
 
-    ax += -DAMP_X * vx;
-    ay += -DAMP_X * vy;
-    az += -DAMP_X * vz;
+    vx += (FX[i*3+0] / M_X) * (0.5f * DT);
+    vy += (FX[i*3+1] / M_Y) * (0.5f * DT);
+    vz += (FX[i*3+2] / M_Z) * (0.5f * DT);
 
-    vx += ax * DT;
-    vy += ay * DT;
-    vz += az * DT;
-
-    x  += vx * DT;
-    y  += vy * DT;
-    z  += vz * DT;
+    float x = X[i*3+0] + vx * DT;
+    float y = X[i*3+1] + vy * DT;
+    float z = X[i*3+2] + vz * DT;
 
     V[i*3+0] = vx;
     V[i*3+1] = vy;
@@ -560,9 +542,84 @@ __global__ void integrate_X(
     X[i*3+2] = z;
 }
 
-// ============================================================
-// VBO fill kernels
-// ============================================================
+__global__ void integrate_finish_X(float* V, const float* FX) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float vx = V[i*3+0];
+    float vy = V[i*3+1];
+    float vz = V[i*3+2];
+
+    vx += (FX[i*3+0] / M_X) * (0.5f * DT);
+    vy += (FX[i*3+1] / M_Y) * (0.5f * DT);
+    vz += (FX[i*3+2] / M_Z) * (0.5f * DT);
+
+    V[i*3+0] = vx;
+    V[i*3+1] = vy;
+    V[i*3+2] = vz;
+}
+
+__global__ void integrate_half_S(float* S, float* Sd, const float* FS) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * N;
+    if (idx >= total) return;
+
+    int i = idx / N;
+    int j = idx - i * N;
+    if (i == j) {
+        S[idx] = 0.0f;
+        Sd[idx] = 0.0f;
+        return;
+    }
+
+    float sd = Sd[idx];
+    sd += (FS[idx] / M_S) * (0.5f * DT);
+    float s = S[idx] + sd * DT;
+
+    Sd[idx] = sd;
+    S[idx] = s;
+}
+
+__global__ void integrate_finish_S(float* Sd, const float* FS) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * N;
+    if (idx >= total) return;
+
+    int i = idx / N;
+    int j = idx - i * N;
+    if (i == j) {
+        Sd[idx] = 0.0f;
+        return;
+    }
+
+    float sd = Sd[idx];
+    sd += (FS[idx] / M_S) * (0.5f * DT);
+    Sd[idx] = sd;
+}
+
+__global__ void apply_damping_X(float* V, float damp) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    V[i*3+0] *= damp;
+    V[i*3+1] *= damp;
+    V[i*3+2] *= damp;
+}
+
+__global__ void apply_damping_S(float* Sd, float damp) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = N * N;
+    if (idx >= total) return;
+
+    int i = idx / N;
+    int j = idx - i * N;
+    if (i == j) {
+        Sd[idx] = 0.0f;
+        return;
+    }
+
+    Sd[idx] *= damp;
+}
 
 __global__ void fill_points_vbo(Vertex* outPts, const float* X, const float* action, const float* entropy, float t) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -600,7 +657,7 @@ __global__ void fill_points_vbo(Vertex* outPts, const float* X, const float* act
     outPts[i] = v;
 }
 
-__global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S, const float* sumExp, const int* edgeU, const int* edgeV, float t) {
+__global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S, const float* rowMaxS, const float* rowLogSumExpS, const int* edgeU, const int* edgeV, float t) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= E) return;
 
@@ -610,14 +667,13 @@ __global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S,
     float xi = X[i*3+0], yi = X[i*3+1], zi = X[i*3+2];
     float xj = X[j*3+0], yj = X[j*3+1], zj = X[j*3+2];
 
-    // Correct directional weights using each direction's logit
-    float expSij = safeExp(S[i*N + j]);
-    float expSji = safeExp(S[j*N + i]);
+    float logPij = (S[i*N + j] - rowMaxS[i]) - rowLogSumExpS[i];
+    float logPji = (S[j*N + i] - rowMaxS[j]) - rowLogSumExpS[j];
 
-    float pij = expSij / (sumExp[i] + EPS);
-    float pji = expSji / (sumExp[j] + EPS);
+    float pij = expf(logPij);
+    float pji = expf(logPji);
+
     float w = 0.5f * (pij + pji);
-
     float tt = clampf(w * 3.5f, 0.0f, 1.0f);
 
     float hue = 0.64f - 0.58f * tt;
@@ -643,10 +699,6 @@ __global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S,
     outLines[2*e + 1] = v1;
 }
 
-// ============================================================
-// OpenGL VBO VAO helper
-// ============================================================
-
 static void createVboVao(GLuint& vao, GLuint& vbo, size_t bytes) {
     glGenVertexArrays(1, &vao);
     glGenBuffers(1, &vbo);
@@ -667,10 +719,6 @@ static void createVboVao(GLuint& vao, GLuint& vbo, size_t bytes) {
 
     GL_CHECK();
 }
-
-// ============================================================
-// Effective dimension estimate for title
-// ============================================================
 
 static float effectiveDimensionFromPositions(const std::vector<float>& hX) {
     glm::vec3 mean(0.0f);
@@ -745,10 +793,6 @@ static float effectiveDimensionFromPositions(const std::vector<float>& hX) {
     return (s1*s1) / s2;
 }
 
-// ============================================================
-// Reset simulation
-// ============================================================
-
 static void reset_sim(
     float* dS, float* dSd,
     float* dX, float* dV,
@@ -759,6 +803,7 @@ static void reset_sim(
 ) {
     std::vector<float> hX(N*3, 0.0f);
     std::vector<float> hVel(N*3, 0.0f);
+
     for (int i = 0; i < N; ++i) {
         float t = (float)i / (float)(N - 1);
         float x = (t * 2.0f - 1.0f) * 1.2f;
@@ -769,13 +814,13 @@ static void reset_sim(
         hX[i*3+2] = z;
     }
 
-    std::vector<float> hS(N*N, S_MIN);
+    std::vector<float> hS(N*N, 0.0f);
     std::vector<float> hSd(N*N, 0.0f);
 
     float S0 = -2.60f;
     for (int i = 0; i < N; ++i) {
         for (int j = 0; j < N; ++j) {
-            if (i == j) hS[i*N + j] = S_MIN;
+            if (i == j) hS[i*N + j] = 0.0f;
             else        hS[i*N + j] = S0;
         }
     }
@@ -789,10 +834,6 @@ static void reset_sim(
     CUDA_CHECK(cudaMemcpy(dEdgeV, hV.data(), E*sizeof(int), cudaMemcpyHostToDevice));
 }
 
-// ============================================================
-// Main
-// ============================================================
-
 int main() {
     if (!glfwInit()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
@@ -802,7 +843,6 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
     glfwWindowHint(GLFW_SAMPLES, 4);
 
     GLFWmonitor* monitor = glfwGetPrimaryMonitor();
@@ -849,9 +889,16 @@ int main() {
 
     glViewport(0, 0, gWidth, gHeight);
 
-    CUDA_CHECK(cudaSetDevice(0));
+    unsigned int cudaDeviceCount = 0;
+    int cudaDevices[16] = {};
+    cudaError_t interopErr = cudaGLGetDevices(&cudaDeviceCount, cudaDevices, 16, cudaGLDeviceListAll);
+    if (interopErr == cudaSuccess && cudaDeviceCount > 0) {
+        CUDA_CHECK(cudaSetDevice(cudaDevices[0]));
+    } else {
+        CUDA_CHECK(cudaSetDevice(0));
+    }
+    CUDA_CHECK(cudaFree(0));
 
-    // Shaders
     const char* bgVS = R"GLSL(
         #version 330 core
         out vec2 vUV;
@@ -866,23 +913,24 @@ int main() {
     )GLSL";
 
     const char* bgFS = R"GLSL(
-       #version 330 core
+        #version 330 core
         in vec2 vUV;
         out vec4 FragColor;
 
         uniform vec2 uResolution;
+        uniform float uTime;
 
         void main() {
             vec2 uv = gl_FragCoord.xy / uResolution;
             vec3 top = vec3(0.06, 0.08, 0.16);
             vec3 bot = vec3(0.01, 0.01, 0.04);
             float g = smoothstep(0.0, 1.0, uv.y);
-            vec3 col = mix(bot, top, g);
+            float wig = 0.008 * sin(uTime * 0.12 + uv.x * 6.0);
+            vec3 col = mix(bot, top, clamp(g + wig, 0.0, 1.0));
             vec2 q = uv * 2.0 - 1.0;
             col *= 1.0 - 0.22 * dot(q, q);
             FragColor = vec4(col, 1.0);
         }
-
     )GLSL";
 
     GLuint bgV = compileShader(GL_VERTEX_SHADER, bgVS);
@@ -948,11 +996,10 @@ int main() {
     glDeleteShader(lfs);
     glDeleteShader(pfs);
 
-    GLint uMVP_line = glGetUniformLocation(lineProg, "uMVP");
+    GLint uMVP_line  = glGetUniformLocation(lineProg, "uMVP");
     GLint uMVP_point = glGetUniformLocation(pointProg, "uMVP");
     GLint uPointSize = glGetUniformLocation(pointProg, "uPointSize");
 
-    // GL state
     glEnable(GL_MULTISAMPLE);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
@@ -960,17 +1007,14 @@ int main() {
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
-    // Create VBOs
     GLuint vaoPts, vboPts;
     GLuint vaoLines, vboLines;
     createVboVao(vaoPts, vboPts, sizeof(Vertex) * (size_t)N);
     createVboVao(vaoLines, vboLines, sizeof(Vertex) * (size_t)(2 * E));
 
-    // Register VBOs with CUDA
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&cudaVboPoints, vboPts, cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&cudaVboLines,  vboLines, cudaGraphicsRegisterFlagsWriteDiscard));
 
-    // Edge list
     std::vector<int> hU(E), hV(E);
     int eidx = 0;
     for (int i = 0; i < N; ++i) {
@@ -981,29 +1025,37 @@ int main() {
         }
     }
 
-    // Allocate device buffers
     float *dS, *dSd, *dX, *dV;
-    float *dSumExp, *dSumTarget;
+    float *dRowMaxS, *dRowLogSumExpS, *dRowMeanS;
+    float *dRowMaxT, *dRowLogSumExpT;
     float *dAction, *dEntropy;
-    float *dFX;
+    float *dFX, *dFS;
     float *dCM, *dSumR2;
     int *dEdgeU, *dEdgeV;
 
-    CUDA_CHECK(cudaMalloc(&dS,        N*N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dSd,       N*N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dX,        N*3*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dV,        N*3*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dSumExp,   N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dSumTarget,N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dAction,   N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dEntropy,  N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dFX,       N*3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dS,               N*N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSd,              N*N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dX,               N*3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dV,               N*3*sizeof(float)));
 
-    CUDA_CHECK(cudaMalloc(&dCM,       3*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dSumR2,    1*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dRowMaxS,         N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dRowLogSumExpS,   N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dRowMeanS,        N*sizeof(float)));
 
-    CUDA_CHECK(cudaMalloc(&dEdgeU,    E*sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dEdgeV,    E*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dRowMaxT,         N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dRowLogSumExpT,   N*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dAction,          N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dEntropy,         N*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dFX,              N*3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dFS,              N*N*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dCM,              3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSumR2,           1*sizeof(float)));
+
+    CUDA_CHECK(cudaMalloc(&dEdgeU,           E*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dEdgeV,           E*sizeof(int)));
 
     reset_sim(dS, dSd, dX, dV, hU, hV, dEdgeU, dEdgeV);
 
@@ -1012,6 +1064,34 @@ int main() {
 
     GLuint bgVAO = 0;
     glGenVertexArrays(1, &bgVAO);
+
+    auto computeForcesAndStats = [&]() {
+        compute_row_stats_S<<<1, 128>>>(dS, dRowMaxS, dRowLogSumExpS);
+        compute_row_mean_S<<<1, 128>>>(dS, dRowMeanS);
+        compute_row_stats_T<<<1, 128>>>(dS, dX, dRowMaxS, dRowLogSumExpS, dRowMaxT, dRowLogSumExpT);
+        compute_row_kl_entropy<<<1, 128>>>(dS, dX, dRowMaxS, dRowLogSumExpS, dRowMaxT, dRowLogSumExpT, dAction, dEntropy);
+
+        zero_array<<<1, 256>>>(dFX, N*3);
+        zero_array<<<(N*N + 255)/256, 256>>>(dFS, N*N);
+
+        compute_edge_forces<<<(E + 255)/256, 256>>>(
+            dS, dX,
+            dRowMaxS, dRowLogSumExpS,
+            dRowMaxT, dRowLogSumExpT,
+            dRowMeanS,
+            dAction,
+            dFX, dFS,
+            dEdgeU, dEdgeV
+        );
+
+        reduce_cm_r2<<<1, 256>>>(dX, dCM, dSumR2);
+        apply_gauge_forces_X<<<1, 128>>>(dX, dFX, dCM, dSumR2);
+
+        CUDA_CHECK(cudaGetLastError());
+    };
+
+    float dampX = expf(-DAMP_X * DT);
+    float dampS = expf(-DAMP_S * DT);
 
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = (float)glfwGetTime();
@@ -1029,26 +1109,25 @@ int main() {
         if (!paused) {
             int substeps = (int)fminf(8.0f, fmaxf(1.0f, deltaTime / DT));
             for (int s = 0; s < substeps; ++s) {
-                compute_row_sum_exp<<<1, 128>>>(dS, dSumExp);
-                compute_row_sum_target<<<1, 128>>>(dS, dX, dSumExp, dSumTarget);
+                computeForcesAndStats();
 
-                zero_array<<<1, 256>>>(dFX, N*3);
-                zero_array<<<1, 128>>>(dAction, N);
+                integrate_half_X<<<1, 128>>>(dX, dV, dFX);
+                integrate_half_S<<<(N*N + 255)/256, 256>>>(dS, dSd, dFS);
 
-                meta_update_and_forces<<<(E + 255)/256, 256>>>(
-                    dS, dSd, dX, dFX, dSumExp, dSumTarget, dAction, dEdgeU, dEdgeV
-                );
+                computeForcesAndStats();
 
-                reduce_cm_r2<<<1, 256>>>(dX, dCM, dSumR2);
-                integrate_X<<<1, 128>>>(dX, dV, dFX, dCM, dSumR2);
+                integrate_finish_X<<<1, 128>>>(dV, dFX);
+                integrate_finish_S<<<(N*N + 255)/256, 256>>>(dSd, dFS);
+
+                apply_damping_X<<<1, 128>>>(dV, dampX);
+                apply_damping_S<<<(N*N + 255)/256, 256>>>(dSd, dampS);
+
+                CUDA_CHECK(cudaGetLastError());
             }
+        } else {
+            computeForcesAndStats();
         }
 
-        // Stats for render
-        compute_row_sum_exp<<<1, 128>>>(dS, dSumExp);
-        compute_entropy<<<1, 128>>>(dS, dSumExp, dEntropy);
-
-        // Update title periodically
         titleAccum += (double)deltaTime;
         if (titleAccum > 0.25) {
             titleAccum = 0.0;
@@ -1062,7 +1141,6 @@ int main() {
             glfwSetWindowTitle(window, oss.str().c_str());
         }
 
-        // Map VBOs and fill with CUDA
         CUDA_CHECK(cudaGraphicsMapResources(1, &cudaVboPoints, 0));
         CUDA_CHECK(cudaGraphicsMapResources(1, &cudaVboLines,  0));
 
@@ -1076,18 +1154,15 @@ int main() {
         float t = (float)glfwGetTime();
 
         fill_points_vbo<<<1, 128>>>(dPts, dX, dAction, dEntropy, t);
-        fill_lines_vbo<<<(E + 255)/256, 256>>>(dLines, dX, dS, dSumExp, dEdgeU, dEdgeV, t);
+        fill_lines_vbo<<<(E + 255)/256, 256>>>(dLines, dX, dS, dRowMaxS, dRowLogSumExpS, dEdgeU, dEdgeV, t);
 
-        // Catch any kernel launch errors early
         CUDA_CHECK(cudaGetLastError());
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVboPoints, 0));
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVboLines,  0));
 
-        // Render
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        // Background
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
         glDisable(GL_BLEND);
@@ -1099,12 +1174,10 @@ int main() {
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindVertexArray(0);
 
-        // Matrices
         glm::mat4 proj = glm::perspective(glm::radians(fov), (float)gWidth/(float)gHeight, 0.05f, 250.0f);
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
         glm::mat4 mvp  = proj * view;
 
-        // Lines
         glEnable(GL_BLEND);
         glEnable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
@@ -1112,13 +1185,10 @@ int main() {
 
         glUseProgram(lineProg);
         glUniformMatrix4fv(uMVP_line, 1, GL_FALSE, glm::value_ptr(mvp));
-
         glBindVertexArray(vaoLines);
         glDrawArrays(GL_LINES, 0, 2 * E);
         glBindVertexArray(0);
 
-        // Points
-        // Fix flashing: no depth test, no depth writes, and alpha blending
         glDisable(GL_DEPTH_TEST);
         glDepthMask(GL_FALSE);
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -1126,18 +1196,15 @@ int main() {
         glUseProgram(pointProg);
         glUniformMatrix4fv(uMVP_point, 1, GL_FALSE, glm::value_ptr(mvp));
         glUniform1f(uPointSize, 11.0f);
-
         glBindVertexArray(vaoPts);
         glDrawArrays(GL_POINTS, 0, N);
         glBindVertexArray(0);
 
-        // Restore depth mask so next frame clears depth correctly
         glDepthMask(GL_TRUE);
 
         glfwSwapBuffers(window);
     }
 
-    // Cleanup
     CUDA_CHECK(cudaGraphicsUnregisterResource(cudaVboPoints));
     CUDA_CHECK(cudaGraphicsUnregisterResource(cudaVboLines));
 
@@ -1156,13 +1223,23 @@ int main() {
     CUDA_CHECK(cudaFree(dSd));
     CUDA_CHECK(cudaFree(dX));
     CUDA_CHECK(cudaFree(dV));
-    CUDA_CHECK(cudaFree(dSumExp));
-    CUDA_CHECK(cudaFree(dSumTarget));
+
+    CUDA_CHECK(cudaFree(dRowMaxS));
+    CUDA_CHECK(cudaFree(dRowLogSumExpS));
+    CUDA_CHECK(cudaFree(dRowMeanS));
+
+    CUDA_CHECK(cudaFree(dRowMaxT));
+    CUDA_CHECK(cudaFree(dRowLogSumExpT));
+
     CUDA_CHECK(cudaFree(dAction));
     CUDA_CHECK(cudaFree(dEntropy));
+
     CUDA_CHECK(cudaFree(dFX));
+    CUDA_CHECK(cudaFree(dFS));
+
     CUDA_CHECK(cudaFree(dCM));
     CUDA_CHECK(cudaFree(dSumR2));
+
     CUDA_CHECK(cudaFree(dEdgeU));
     CUDA_CHECK(cudaFree(dEdgeV));
 
