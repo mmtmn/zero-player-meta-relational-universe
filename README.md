@@ -1,6 +1,7 @@
 # zero player meta relational least principle action
 
 https://github.com/user-attachments/assets/a6f966c4-aa4d-4207-9611-0a76adba3a1b
+<img width="2472" height="1238" alt="image" src="https://github.com/user-attachments/assets/ba452302-7178-4695-86f0-48dd5043ef4b" />
 
 a zero player game using meta relations and least principle actions.
 
