@@ -2,38 +2,12 @@
 // ============================================================
 // CUDA + OpenGL interop zero player meta relational universe
 //
-// What changed versus the relational mechanics version
-// 1) Relations are a stochastic kernel per row (softmax of symmetric logits S)
-//    P(i->j) = exp(S_ij) / sum_k!=i exp(S_ik)
-// 2) A meta transformer F maps current relations and geometry to target relations
-//    Q(i->j) = softmax_j( T_ij )
-//    T_ij = K_MEMORY * log(P(i->j) + eps) - GAMMA_META * ||X_i - X_j||^2
-// 3) The meta action density is KL(P || Q) and the discrete Euler Lagrange stationarity
-//    log P_next ~ log Q becomes a damped relaxation on S:
-//    Sddot + DAMP_S * Sdot = K_META * 0.5[(log Qij - log Pij) + (log Qji - log Pji)]
-//
-// Geometry X evolves as a coupled field using weighted edge forces derived from P.
-// Everything is deterministic.
-//
-// Rendering
-// - Fullscreen at native display resolution
-// - Background shader with gradient, vignetting, stars
-// - Lines colored by relation weight, additive glow
-// - Points are soft sprites colored by local action and entropy
-//
-// Build
-//   nvcc -O3 -std=c++17 zero_player_meta_relational_universe.cu -lglfw -lGL -lGLEW -o universe
-//
-// Run
-//   ./universe
-//
-// Controls
-// - Mouse: look
-// - WASD: move
-// - Q E: down up
-// - Space: pause physics
-// - R: reset
-// - Esc: quit
+// Fixes applied
+// 1) Correct directional probabilities: p(i->j) uses S_ij and p(j->i) uses S_ji
+//    Also symmetrize the integrated S and Sd using averages to kill any drift.
+// 2) Stop point flashing: render points without depth testing and without depth writes,
+//    and use non additive alpha blending for points.
+// 3) Enable program point size so gl_PointSize from the vertex shader is respected.
 // ============================================================
 
 #include <cstdio>
@@ -101,16 +75,16 @@ static const int E = (N * (N - 1)) / 2;
 static const float DT = 0.010f;
 
 // Meta relation parameters
-static const float K_META     = 3.25f;   // relaxation strength toward log Q
-static const float DAMP_S     = 0.65f;   // relation velocity damping
-static const float K_MEMORY   = 1.35f;   // memory exponent in transformer
-static const float GAMMA_META = 2.20f;   // geometry term inside transformer
+static const float K_META     = 3.25f;
+static const float DAMP_S     = 0.65f;
+static const float K_MEMORY   = 1.35f;
+static const float GAMMA_META = 2.20f;
 
 // Geometry coupling
-static const float GAMMA_GEO  = 10.0f;   // weighted spring strength from P
-static const float ETA_REP    = 0.025f;  // repulsion
-static const float DELTA_REP  = 0.020f;  // repulsion softening
-static const float DAMP_X     = 0.20f;   // geometry velocity damping
+static const float GAMMA_GEO  = 10.0f;
+static const float ETA_REP    = 0.025f;
+static const float DELTA_REP  = 0.020f;
+static const float DAMP_X     = 0.20f;
 
 // Gauge fixing
 static const float K_CM       = 2.00f;
@@ -329,17 +303,6 @@ __device__ __forceinline__ void hsv2rgb(float h, float s, float v, float& r, flo
 
 // ============================================================
 // Kernels
-// State
-// S NxN symmetric logits, diag unused
-// Sd NxN symmetric velocities for S
-// X Nx3 positions
-// V Nx3 velocities
-// sumExp N, row sums of exp(S)
-// sumTarget N, row sums of exp(T)
-// action N, action density per node, approx KL(P||Q) row contribution
-// entropy N, row entropy of P
-// edgeU edgeV E lists i<j
-// FX Nx3 forces for X
 // ============================================================
 
 __global__ void zero_array(float* a, int n) {
@@ -476,10 +439,12 @@ __global__ void meta_update_and_forces(
     float Zi = sumExp[i];
     float Zj = sumExp[j];
 
+    // Use each direction's logit for each direction's probability
     float expSij = safeExp(S[ij]);
+    float expSji = safeExp(S[ji]);
 
     float pij = expSij / Zi;
-    float pji = expSij / Zj;
+    float pji = expSji / Zj;
 
     float Ti_j = K_MEMORY * safeLog(pij) - GAMMA_META * dist2;
     float Tj_i = K_MEMORY * safeLog(pji) - GAMMA_META * dist2;
@@ -494,10 +459,14 @@ __global__ void meta_update_and_forces(
 
     float deltaLog = 0.5f * ((logqij - logpij) + (logqji - logpji));
 
-    float accS = K_META * deltaLog - DAMP_S * Sd[ij];
+    // Symmetrize state before integrating to suppress any drift
+    float Sd_cur = 0.5f * (Sd[ij] + Sd[ji]);
+    float S_cur  = 0.5f * (S[ij]  + S[ji]);
 
-    float Sd_new = Sd[ij] + accS * DT;
-    float S_new  = S[ij]  + Sd_new * DT;
+    float accS = K_META * deltaLog - DAMP_S * Sd_cur;
+
+    float Sd_new = Sd_cur + accS * DT;
+    float S_new  = S_cur  + Sd_new * DT;
 
     S_new = clampf(S_new, S_MIN, S_MAX);
 
@@ -506,7 +475,7 @@ __global__ void meta_update_and_forces(
     S[ij]  = S_new;
     S[ji]  = S_new;
 
-    // Action density accumulation
+    // Action density accumulation (directed KL row contributions)
     atomicAdd(&action[i], pij * (logpij - logqij));
     atomicAdd(&action[j], pji * (logpji - logqji));
 
@@ -610,7 +579,6 @@ __global__ void fill_points_vbo(Vertex* outPts, const float* X, const float* act
     float Hmax = logf((float)(N - 1));
     float hnorm = clampf(H / fmaxf(Hmax, 1e-6f), 0.0f, 1.0f);
 
-    // Hue based on entropy, brightness based on action
     float hue = 0.68f - 0.62f * (1.0f - hnorm);
     hue += 0.02f * sinf(0.7f * t + 0.31f * (float)i);
 
@@ -642,9 +610,12 @@ __global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S,
     float xi = X[i*3+0], yi = X[i*3+1], zi = X[i*3+2];
     float xj = X[j*3+0], yj = X[j*3+1], zj = X[j*3+2];
 
+    // Correct directional weights using each direction's logit
     float expSij = safeExp(S[i*N + j]);
+    float expSji = safeExp(S[j*N + i]);
+
     float pij = expSij / (sumExp[i] + EPS);
-    float pji = expSij / (sumExp[j] + EPS);
+    float pji = expSji / (sumExp[j] + EPS);
     float w = 0.5f * (pij + pji);
 
     float tt = clampf(w * 3.5f, 0.0f, 1.0f);
@@ -786,7 +757,6 @@ static void reset_sim(
     int* dEdgeU,
     int* dEdgeV
 ) {
-    // Deterministic initial geometry, almost 1D line with tiny deterministic transverse offsets
     std::vector<float> hX(N*3, 0.0f);
     std::vector<float> hVel(N*3, 0.0f);
     for (int i = 0; i < N; ++i) {
@@ -799,7 +769,6 @@ static void reset_sim(
         hX[i*3+2] = z;
     }
 
-    // Initial logits S, uniform off diagonal
     std::vector<float> hS(N*N, S_MIN);
     std::vector<float> hSd(N*N, 0.0f);
 
@@ -880,7 +849,7 @@ int main() {
 
     glViewport(0, 0, gWidth, gHeight);
 
-    CUDA_CHECK(cudaGLSetGLDevice(0));
+    CUDA_CHECK(cudaSetDevice(0));
 
     // Shaders
     const char* bgVS = R"GLSL(
@@ -897,29 +866,22 @@ int main() {
     )GLSL";
 
     const char* bgFS = R"GLSL(
-#version 330 core
-in vec2 vUV;
-out vec4 FragColor;
+       #version 330 core
+        in vec2 vUV;
+        out vec4 FragColor;
 
-uniform vec2 uResolution;
-uniform float uTime;
+        uniform vec2 uResolution;
 
-void main() {
-    vec2 uv = gl_FragCoord.xy / uResolution;
-
-    // Vertical gradient
-    vec3 top = vec3(0.06, 0.08, 0.16);
-    vec3 bot = vec3(0.01, 0.01, 0.04);
-    float g = smoothstep(0.0, 1.0, uv.y);
-    vec3 col = mix(bot, top, g);
-
-    // Subtle vignette
-    vec2 q = uv * 2.0 - 1.0;
-    float vignette = 1.0 - 0.22 * dot(q, q);
-    col *= vignette;
-
-    FragColor = vec4(col, 1.0);
-}
+        void main() {
+            vec2 uv = gl_FragCoord.xy / uResolution;
+            vec3 top = vec3(0.06, 0.08, 0.16);
+            vec3 bot = vec3(0.01, 0.01, 0.04);
+            float g = smoothstep(0.0, 1.0, uv.y);
+            vec3 col = mix(bot, top, g);
+            vec2 q = uv * 2.0 - 1.0;
+            col *= 1.0 - 0.22 * dot(q, q);
+            FragColor = vec4(col, 1.0);
+        }
 
     )GLSL";
 
@@ -968,8 +930,8 @@ void main() {
             if (r2 > 1.0) discard;
 
             float glow = exp(-3.0 * r2);
-            vec3 col = vColor.rgb * (0.28 + 0.92 * glow);
-            float a = vColor.a * (0.20 + 0.80 * glow);
+            vec3 col = clamp(vColor.rgb * (0.28 + 0.92 * glow), 0.0, 1.0);
+            float a = clamp(vColor.a * (0.20 + 0.80 * glow), 0.0, 1.0);
 
             FragColor = vec4(col, a);
         }
@@ -994,6 +956,7 @@ void main() {
     glEnable(GL_MULTISAMPLE);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
+    glEnable(GL_PROGRAM_POINT_SIZE);
 
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 
@@ -1115,6 +1078,9 @@ void main() {
         fill_points_vbo<<<1, 128>>>(dPts, dX, dAction, dEntropy, t);
         fill_lines_vbo<<<(E + 255)/256, 256>>>(dLines, dX, dS, dSumExp, dEdgeU, dEdgeV, t);
 
+        // Catch any kernel launch errors early
+        CUDA_CHECK(cudaGetLastError());
+
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVboPoints, 0));
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVboLines,  0));
 
@@ -1133,37 +1099,40 @@ void main() {
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glBindVertexArray(0);
 
-        glEnable(GL_BLEND);
-        glEnable(GL_DEPTH_TEST);
-        glDepthMask(GL_TRUE);
-
         // Matrices
         glm::mat4 proj = glm::perspective(glm::radians(fov), (float)gWidth/(float)gHeight, 0.05f, 250.0f);
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
         glm::mat4 mvp  = proj * view;
 
         // Lines
+        glEnable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+
         glUseProgram(lineProg);
         glUniformMatrix4fv(uMVP_line, 1, GL_FALSE, glm::value_ptr(mvp));
-
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-        glDepthMask(GL_FALSE);
 
         glBindVertexArray(vaoLines);
         glDrawArrays(GL_LINES, 0, 2 * E);
         glBindVertexArray(0);
 
         // Points
+        // Fix flashing: no depth test, no depth writes, and alpha blending
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
         glUseProgram(pointProg);
         glUniformMatrix4fv(uMVP_point, 1, GL_FALSE, glm::value_ptr(mvp));
         glUniform1f(uPointSize, 11.0f);
 
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-        glDepthMask(GL_TRUE);
-
         glBindVertexArray(vaoPts);
         glDrawArrays(GL_POINTS, 0, N);
         glBindVertexArray(0);
+
+        // Restore depth mask so next frame clears depth correctly
+        glDepthMask(GL_TRUE);
 
         glfwSwapBuffers(window);
     }
