@@ -1,34 +1,38 @@
-// zero_player_relational_universe.cu
+// zero_player_meta_relational_universe.cu
 // ============================================================
-// High quality CUDA + OpenGL interop "zero player" relational universe
+// CUDA + OpenGL interop zero player meta relational universe
 //
-// Core idea (implemented, not just talked about):
-// - Relations are the ontology: S_ij are unconstrained relation log strengths
-//   R_ij = exp(S_ij) are positive relation strengths
-// - Geometry is a field X_i in R^3, not assumed "given" but evolved as a coupled field
-// - Dynamics follow from a single potential energy V (least action with Rayleigh dissipation)
-//   d/dt(∂T/∂qdot) + ∂D/∂qdot + ∂V/∂q = 0
+// What changed versus the relational mechanics version
+// 1) Relations are a stochastic kernel per row (softmax of symmetric logits S)
+//    P(i->j) = exp(S_ij) / sum_k!=i exp(S_ik)
+// 2) A meta transformer F maps current relations and geometry to target relations
+//    Q(i->j) = softmax_j( T_ij )
+//    T_ij = K_MEMORY * log(P(i->j) + eps) - GAMMA_META * ||X_i - X_j||^2
+// 3) The meta action density is KL(P || Q) and the discrete Euler Lagrange stationarity
+//    log P_next ~ log Q becomes a damped relaxation on S:
+//    Sddot + DAMP_S * Sdot = K_META * 0.5[(log Qij - log Pij) + (log Qji - log Pji)]
 //
-// No randomness, no schedulers, no “unlock dimension” flags.
-// What looks like pruning emerges from the distance cost and material cost.
+// Geometry X evolves as a coupled field using weighted edge forces derived from P.
+// Everything is deterministic.
 //
-// Rendering:
-// - Modern OpenGL 3.3 core
-// - CUDA writes directly into OpenGL VBOs via cudaGraphicsGLRegisterBuffer
-// - Camera controls: mouse look, WASD move, scroll FOV (based on your example style)
+// Rendering
+// - Fullscreen at native display resolution
+// - Background shader with gradient, vignetting, stars
+// - Lines colored by relation weight, additive glow
+// - Points are soft sprites colored by local action and entropy
 //
-// Build:
-//   nvcc -O3 zero_player_relational_universe.cu -lglfw -lGL -lGLEW -o universe
+// Build
+//   nvcc -O3 -std=c++17 zero_player_meta_relational_universe.cu -lglfw -lGL -lGLEW -o universe
 //
-// Run:
+// Run
 //   ./universe
 //
-// Controls:
+// Controls
 // - Mouse: look
 // - WASD: move
-// - Q/E: move down/up
+// - Q E: down up
 // - Space: pause physics
-// - R: reset physics
+// - R: reset
 // - Esc: quit
 // ============================================================
 
@@ -39,24 +43,21 @@
 #include <string>
 #include <sstream>
 
-// ---- GLEW MUST COME FIRST ----
+// GLEW first
 #include <GL/glew.h>
-
-// ---- Then GLFW (brings in OpenGL) ----
+// GLFW next
 #include <GLFW/glfw3.h>
-
-// ---- CUDA AFTER OpenGL headers ----
+// CUDA after OpenGL headers
 #include <cuda_runtime.h>
 #include <cuda_gl_interop.h>
 
-// ---- GLM is header-only, safe anywhere ----
+// GLM
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 
-
 // ============================================================
-// Error checking macros
+// Error checking
 // ============================================================
 
 #define CUDA_CHECK(call) do { \
@@ -88,47 +89,53 @@ static const char* glErrToStr(GLenum err) {
 } while(0)
 
 // ============================================================
-// Simulation + render config
+// Simulation config
 // ============================================================
 
-static const int WIDTH  = 1280;
-static const int HEIGHT = 800;
+static int gWidth  = 1280;
+static int gHeight = 720;
 
-static const int N = 48;                         // entities
-static const int E = (N * (N - 1)) / 2;           // undirected edges i<j
+static const int N = 48;
+static const int E = (N * (N - 1)) / 2;
 
-// Physics time step
 static const float DT = 0.010f;
 
-// Potential weights (tuneable, but deterministic)
-static const float LAMBDA_DEG = 6.0f;            // degree budget constraint weight
-static const float MU_MAT     = 0.25f;           // material cost on relations
-static const float GAMMA_GEO  = 2.0f;            // geometry coupling (short edges preferred)
-static const float ETA_REP    = 0.010f;          // repulsion (prevents collapse)
-static const float DELTA_REP  = 0.010f;          // repulsion softening
-static const float K_CM       = 2.0f;            // center of mass gauge fixing
-static const float K_SCALE    = 6.0f;            // scale gauge fixing
-static const float TARGET_RMS = 1.2f;            // target RMS radius
+// Meta relation parameters
+static const float K_META     = 3.25f;   // relaxation strength toward log Q
+static const float DAMP_S     = 0.65f;   // relation velocity damping
+static const float K_MEMORY   = 1.35f;   // memory exponent in transformer
+static const float GAMMA_META = 2.20f;   // geometry term inside transformer
 
-// Rayleigh dissipation (physical damping, still zero player)
-static const float DAMP_S = 0.35f;               // relation velocity damping
-static const float DAMP_X = 0.20f;               // geometry velocity damping
+// Geometry coupling
+static const float GAMMA_GEO  = 10.0f;   // weighted spring strength from P
+static const float ETA_REP    = 0.025f;  // repulsion
+static const float DELTA_REP  = 0.020f;  // repulsion softening
+static const float DAMP_X     = 0.20f;   // geometry velocity damping
 
-// Anisotropic masses create natural time-scale separation (1D looks stable first)
+// Gauge fixing
+static const float K_CM       = 2.00f;
+static const float K_SCALE    = 6.50f;
+static const float TARGET_RMS = 1.15f;
+
+// Anisotropic masses
 static const float M_X = 1.0f;
 static const float M_Y = 6.0f;
-static const float M_Z = 20.0f;
+static const float M_Z = 18.0f;
 
 // Numeric safety for exp(S)
-static const float S_MIN = -12.0f;               // exp(-12) ~ 6e-6
-static const float S_MAX =  4.0f;                // exp(4) ~ 54
+static const float S_MIN = -12.0f;
+static const float S_MAX =  4.0f;
 
-// Render mapping for edge alpha
-static const float EDGE_ALPHA_GAIN = 0.18f;      // alpha = 1 - exp(-gain*R)
-static const float EDGE_ALPHA_MAX  = 0.65f;
+static const float EPS = 1e-12f;
+
+// Render tuning
+static const float EDGE_ALPHA_MAX  = 0.85f;
+static const float EDGE_ALPHA_GAIN = 2.60f;
+
+static const float ACTION_GAIN     = 2.80f;
 
 // ============================================================
-// Camera + input state (based on your style)
+// Camera and input
 // ============================================================
 
 static glm::vec3 cameraPos   = glm::vec3(0.0f, 0.0f, 6.0f);
@@ -137,10 +144,10 @@ static glm::vec3 cameraUp    = glm::vec3(0.0f, 1.0f, 0.0f);
 
 static float yaw   = -90.0f;
 static float pitch =   0.0f;
-static float fov   =  45.0f;
+static float fov   =  50.0f;
 
-static float lastX = WIDTH * 0.5f;
-static float lastY = HEIGHT * 0.5f;
+static float lastX = 0.0f;
+static float lastY = 0.0f;
 static bool  firstMouse = true;
 
 static float deltaTime = 0.0f;
@@ -149,60 +156,16 @@ static float lastFrame = 0.0f;
 static bool keys[1024] = { false };
 static bool paused = false;
 
-// ============================================================
-// CUDA <-> OpenGL interop resources
-// ============================================================
-
-struct Vertex {
-    float px, py, pz;      // position
-    float cr, cg, cb, ca;  // color RGBA
-};
-
-static cudaGraphicsResource_t cudaVboPoints = nullptr;
-static cudaGraphicsResource_t cudaVboLines  = nullptr;
-
-// ============================================================
-// OpenGL helpers: shader compilation
-// ============================================================
-
-static GLuint compileShader(GLenum type, const char* src) {
-    GLuint sh = glCreateShader(type);
-    glShaderSource(sh, 1, &src, nullptr);
-    glCompileShader(sh);
-
-    GLint ok = 0;
-    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
-    if (!ok) {
-        char log[2048];
-        glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
-        fprintf(stderr, "Shader compile failed: %s\n", log);
-        exit(EXIT_FAILURE);
-    }
-    return sh;
+static void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
+    (void)window;
+    if (width <= 0 || height <= 0) return;
+    gWidth = width;
+    gHeight = height;
+    glViewport(0, 0, gWidth, gHeight);
 }
-
-static GLuint linkProgram(GLuint vs, GLuint fs) {
-    GLuint prog = glCreateProgram();
-    glAttachShader(prog, vs);
-    glAttachShader(prog, fs);
-    glLinkProgram(prog);
-
-    GLint ok = 0;
-    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
-    if (!ok) {
-        char log[2048];
-        glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
-        fprintf(stderr, "Program link failed: %s\n", log);
-        exit(EXIT_FAILURE);
-    }
-    return prog;
-}
-
-// ============================================================
-// Callbacks (mouse, scroll, keyboard) with camera controls
-// ============================================================
 
 static void mouse_callback(GLFWwindow* window, double xposIn, double yposIn) {
+    (void)window;
     float xpos = (float)xposIn;
     float ypos = (float)yposIn;
 
@@ -225,7 +188,7 @@ static void mouse_callback(GLFWwindow* window, double xposIn, double yposIn) {
     yaw   += xoffset;
     pitch += yoffset;
 
-    if (pitch > 89.0f) pitch = 89.0f;
+    if (pitch > 89.0f)  pitch = 89.0f;
     if (pitch < -89.0f) pitch = -89.0f;
 
     glm::vec3 front;
@@ -236,9 +199,10 @@ static void mouse_callback(GLFWwindow* window, double xposIn, double yposIn) {
 }
 
 static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset) {
+    (void)window;
     (void)xoffset;
     fov -= (float)yoffset;
-    if (fov < 10.0f) fov = 10.0f;
+    if (fov < 12.0f) fov = 12.0f;
     if (fov > 90.0f) fov = 90.0f;
 }
 
@@ -258,6 +222,67 @@ static void key_callback(GLFWwindow* window, int key, int scancode, int action, 
         paused = !paused;
 }
 
+static void processInput(float dt) {
+    float speed = 5.0f * dt;
+    glm::vec3 right = glm::normalize(glm::cross(cameraFront, cameraUp));
+
+    if (keys[GLFW_KEY_W]) cameraPos += speed * cameraFront;
+    if (keys[GLFW_KEY_S]) cameraPos -= speed * cameraFront;
+    if (keys[GLFW_KEY_A]) cameraPos -= speed * right;
+    if (keys[GLFW_KEY_D]) cameraPos += speed * right;
+    if (keys[GLFW_KEY_Q]) cameraPos -= speed * cameraUp;
+    if (keys[GLFW_KEY_E]) cameraPos += speed * cameraUp;
+}
+
+// ============================================================
+// CUDA OpenGL interop
+// ============================================================
+
+struct Vertex {
+    float px, py, pz;
+    float cr, cg, cb, ca;
+};
+
+static cudaGraphicsResource_t cudaVboPoints = nullptr;
+static cudaGraphicsResource_t cudaVboLines  = nullptr;
+
+// ============================================================
+// OpenGL shader helpers
+// ============================================================
+
+static GLuint compileShader(GLenum type, const char* src) {
+    GLuint sh = glCreateShader(type);
+    glShaderSource(sh, 1, &src, nullptr);
+    glCompileShader(sh);
+
+    GLint ok = 0;
+    glGetShaderiv(sh, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetShaderInfoLog(sh, sizeof(log), nullptr, log);
+        fprintf(stderr, "Shader compile failed: %s\n", log);
+        exit(EXIT_FAILURE);
+    }
+    return sh;
+}
+
+static GLuint linkProgram(GLuint vs, GLuint fs) {
+    GLuint prog = glCreateProgram();
+    glAttachShader(prog, vs);
+    glAttachShader(prog, fs);
+    glLinkProgram(prog);
+
+    GLint ok = 0;
+    glGetProgramiv(prog, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char log[4096];
+        glGetProgramInfoLog(prog, sizeof(log), nullptr, log);
+        fprintf(stderr, "Program link failed: %s\n", log);
+        exit(EXIT_FAILURE);
+    }
+    return prog;
+}
+
 // ============================================================
 // CUDA device helpers
 // ============================================================
@@ -271,42 +296,110 @@ __device__ __forceinline__ float safeExp(float x) {
     return expf(x);
 }
 
+__device__ __forceinline__ float safeLog(float x) {
+    return logf(fmaxf(x, EPS));
+}
+
 __device__ __forceinline__ void atomicAdd3(float* fx, float* fy, float* fz, float ax, float ay, float az) {
     atomicAdd(fx, ax);
     atomicAdd(fy, ay);
     atomicAdd(fz, az);
 }
 
+__device__ __forceinline__ void hsv2rgb(float h, float s, float v, float& r, float& g, float& b) {
+    h = h - floorf(h);
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h * 6.0f, 2.0f) - 1.0f));
+    float m = v - c;
+
+    float rp=0, gp=0, bp=0;
+    float hp = h * 6.0f;
+
+    if (hp < 1.0f)      { rp=c; gp=x; bp=0; }
+    else if (hp < 2.0f) { rp=x; gp=c; bp=0; }
+    else if (hp < 3.0f) { rp=0; gp=c; bp=x; }
+    else if (hp < 4.0f) { rp=0; gp=x; bp=c; }
+    else if (hp < 5.0f) { rp=x; gp=0; bp=c; }
+    else                { rp=c; gp=0; bp=x; }
+
+    r = rp + m;
+    g = gp + m;
+    b = bp + m;
+}
+
 // ============================================================
-// CUDA kernels: simulation
-// State:
-// - S: NxN symmetric, diag unused. R = exp(S)
-// - Sd: NxN symmetric velocities for S
-// - X: Nx3 positions
-// - V: Nx3 velocities
-// - deg: N vector of degrees deg_i = sum_j R_ij
-// - b: N vector target degree budget
-// - edgeU, edgeV: E edges listing i<j
+// Kernels
+// State
+// S NxN symmetric logits, diag unused
+// Sd NxN symmetric velocities for S
+// X Nx3 positions
+// V Nx3 velocities
+// sumExp N, row sums of exp(S)
+// sumTarget N, row sums of exp(T)
+// action N, action density per node, approx KL(P||Q) row contribution
+// entropy N, row entropy of P
+// edgeU edgeV E lists i<j
+// FX Nx3 forces for X
 // ============================================================
 
-__global__ void compute_degree(const float* S, float* deg) {
+__global__ void zero_array(float* a, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    a[i] = 0.0f;
+}
+
+__global__ void compute_row_sum_exp(const float* S, float* sumExp) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
-    float sum = 0.0f;
+    float s = 0.0f;
     int base = i * N;
     for (int j = 0; j < N; ++j) {
         if (j == i) continue;
-        float Rij = safeExp(S[base + j]);
-        sum += Rij;
+        s += safeExp(S[base + j]);
     }
-    deg[i] = sum;
+    sumExp[i] = fmaxf(s, EPS);
 }
 
-__global__ void zero_forces(float* FX) {
+__global__ void compute_row_sum_target(const float* S, const float* X, const float* sumExp, float* sumTarget) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N * 3) return;
-    FX[i] = 0.0f;
+    if (i >= N) return;
+
+    float xi = X[i*3+0], yi = X[i*3+1], zi = X[i*3+2];
+    float Zi = sumExp[i];
+
+    float st = 0.0f;
+    int base = i * N;
+
+    for (int j = 0; j < N; ++j) {
+        if (j == i) continue;
+        float xj = X[j*3+0], yj = X[j*3+1], zj = X[j*3+2];
+        float dx = xi - xj;
+        float dy = yi - yj;
+        float dz = zi - zj;
+        float dist2 = dx*dx + dy*dy + dz*dz;
+
+        float pij = safeExp(S[base + j]) / Zi;
+        float Tij = K_MEMORY * safeLog(pij) - GAMMA_META * dist2;
+        st += expf(Tij);
+    }
+
+    sumTarget[i] = fmaxf(st, EPS);
+}
+
+__global__ void compute_entropy(const float* S, const float* sumExp, float* entropy) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+
+    float Zi = sumExp[i];
+    float H = 0.0f;
+    int base = i * N;
+    for (int j = 0; j < N; ++j) {
+        if (j == i) continue;
+        float pij = safeExp(S[base + j]) / Zi;
+        H += -pij * safeLog(pij);
+    }
+    entropy[i] = H;
 }
 
 __global__ void reduce_cm_r2(const float* X, float* outCM, float* outR2) {
@@ -352,14 +445,15 @@ __global__ void reduce_cm_r2(const float* X, float* outCM, float* outR2) {
     }
 }
 
-__global__ void edge_forces_and_update_S(
+__global__ void meta_update_and_forces(
     float* S, float* Sd,
     const float* X,
-    const float* deg,
-    const float* b,
+    float* FX,
+    const float* sumExp,
+    const float* sumTarget,
+    float* action,
     const int* edgeU,
-    const int* edgeV,
-    float* FX
+    const int* edgeV
 ) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= E) return;
@@ -370,9 +464,6 @@ __global__ void edge_forces_and_update_S(
     int ij = i * N + j;
     int ji = j * N + i;
 
-    float Si = S[ij];
-    float Rij = safeExp(Si);
-
     float xi = X[i*3+0], yi = X[i*3+1], zi = X[i*3+2];
     float xj = X[j*3+0], yj = X[j*3+1], zj = X[j*3+2];
 
@@ -382,27 +473,32 @@ __global__ void edge_forces_and_update_S(
 
     float dist2 = dx*dx + dy*dy + dz*dz + 1e-12f;
 
-    // Potential components:
-    // V_deg = (lambda/2) sum_i (deg_i - b_i)^2
-    // V_mat = (mu/2) sum_ij R_ij^2
-    // V_geo = (gamma/2) sum_ij R_ij * ||Xi - Xj||^2
-    //
-    // dV/dR_ij = lambda[(deg_i - b_i) + (deg_j - b_j)] + mu*R_ij + (gamma/2)*dist2
-    float dVdR = LAMBDA_DEG * ((deg[i] - b[i]) + (deg[j] - b[j]))
-               + MU_MAT * Rij
-               + 0.5f * GAMMA_GEO * dist2;
+    float Zi = sumExp[i];
+    float Zj = sumExp[j];
 
-    // Since R = exp(S), dR/dS = R, so dV/dS = dV/dR * R
-    float dVdS = dVdR * Rij;
+    float expSij = safeExp(S[ij]);
 
-    // Equation with Rayleigh dissipation: Sddot + DAMP_S * Sdot + dV/dS = 0
-    // Using symplectic-ish explicit update:
-    float accS = -dVdS - DAMP_S * Sd[ij];
+    float pij = expSij / Zi;
+    float pji = expSij / Zj;
+
+    float Ti_j = K_MEMORY * safeLog(pij) - GAMMA_META * dist2;
+    float Tj_i = K_MEMORY * safeLog(pji) - GAMMA_META * dist2;
+
+    float qi_j = expf(Ti_j) / (sumTarget[i] + EPS);
+    float qj_i = expf(Tj_i) / (sumTarget[j] + EPS);
+
+    float logpij = safeLog(pij);
+    float logpji = safeLog(pji);
+    float logqij = safeLog(qi_j);
+    float logqji = safeLog(qj_i);
+
+    float deltaLog = 0.5f * ((logqij - logpij) + (logqji - logpji));
+
+    float accS = K_META * deltaLog - DAMP_S * Sd[ij];
 
     float Sd_new = Sd[ij] + accS * DT;
     float S_new  = S[ij]  + Sd_new * DT;
 
-    // clamp to avoid exp blowup
     S_new = clampf(S_new, S_MIN, S_MAX);
 
     Sd[ij] = Sd_new;
@@ -410,22 +506,24 @@ __global__ void edge_forces_and_update_S(
     S[ij]  = S_new;
     S[ji]  = S_new;
 
-    // Geometry forces:
-    // From V_geo: F = -∂V/∂X_i = -gamma * R_ij * (Xi - Xj)
-    float fx = -GAMMA_GEO * Rij * dx;
-    float fy = -GAMMA_GEO * Rij * dy;
-    float fz = -GAMMA_GEO * Rij * dz;
+    // Action density accumulation
+    atomicAdd(&action[i], pij * (logpij - logqij));
+    atomicAdd(&action[j], pji * (logpji - logqji));
 
-    // Repulsion:
-    // V_rep = (eta/2) sum 1/(dist2 + delta)
-    // Force magnitude: +eta * (Xi - Xj) / (dist2 + delta)^2
+    // Geometry forces weighted by symmetric relation weight
+    float w = 0.5f * (pij + pji);
+
+    float fx = -GAMMA_GEO * w * dx;
+    float fy = -GAMMA_GEO * w * dy;
+    float fz = -GAMMA_GEO * w * dz;
+
+    // Repulsion
     float denom = (dist2 + DELTA_REP);
     float repScale = ETA_REP / (denom * denom);
     fx += repScale * dx;
     fy += repScale * dy;
     fz += repScale * dz;
 
-    // Accumulate forces atomically
     atomicAdd3(&FX[i*3+0], &FX[i*3+1], &FX[i*3+2], fx, fy, fz);
     atomicAdd3(&FX[j*3+0], &FX[j*3+1], &FX[j*3+2], -fx, -fy, -fz);
 }
@@ -454,24 +552,20 @@ __global__ void integrate_X(
     float fy = FX[i*3+1];
     float fz = FX[i*3+2];
 
-    // Gauge fixing forces
-    // Center of mass
+    // Gauge fixing
     fx += -K_CM * cmx;
     fy += -K_CM * cmy;
     fz += -K_CM * cmz;
 
-    // Scale
     float scaleCoef = -K_SCALE * scaleErr * (2.0f / (float)N);
     fx += scaleCoef * x;
     fy += scaleCoef * y;
     fz += scaleCoef * z;
 
-    // Anisotropic masses
     float ax = fx / M_X;
     float ay = fy / M_Y;
     float az = fz / M_Z;
 
-    // Rayleigh dissipation: Xddot + DAMP_X * Xdot + dV/dX = 0
     float vx = V[i*3+0];
     float vy = V[i*3+1];
     float vz = V[i*3+2];
@@ -498,10 +592,10 @@ __global__ void integrate_X(
 }
 
 // ============================================================
-// CUDA kernels: write to OpenGL VBOs (interop)
+// VBO fill kernels
 // ============================================================
 
-__global__ void fill_points_vbo(Vertex* outPts, const float* X, const float* deg, const float* b) {
+__global__ void fill_points_vbo(Vertex* outPts, const float* X, const float* action, const float* entropy, float t) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
 
@@ -509,24 +603,36 @@ __global__ void fill_points_vbo(Vertex* outPts, const float* X, const float* deg
     float y = X[i*3+1];
     float z = X[i*3+2];
 
-    float err = fabsf(deg[i] - b[i]);
-    float heat = 1.0f - expf(-1.25f * err);
+    float a = action[i];
+    float heat = 1.0f - expf(-ACTION_GAIN * fmaxf(a, 0.0f));
+
+    float H = entropy[i];
+    float Hmax = logf((float)(N - 1));
+    float hnorm = clampf(H / fmaxf(Hmax, 1e-6f), 0.0f, 1.0f);
+
+    // Hue based on entropy, brightness based on action
+    float hue = 0.68f - 0.62f * (1.0f - hnorm);
+    hue += 0.02f * sinf(0.7f * t + 0.31f * (float)i);
+
+    float sat = 0.30f + 0.70f * heat;
+    float val = 0.65f + 0.35f * heat;
+
+    float r, g, b;
+    hsv2rgb(hue, sat, val, r, g, b);
 
     Vertex v;
     v.px = x;
     v.py = y;
     v.pz = z;
-
-    // White to warm color based on constraint stress
-    v.cr = 0.90f + 0.10f * heat;
-    v.cg = 0.90f - 0.35f * heat;
-    v.cb = 0.95f - 0.55f * heat;
-    v.ca = 1.00f;
+    v.cr = r;
+    v.cg = g;
+    v.cb = b;
+    v.ca = 1.0f;
 
     outPts[i] = v;
 }
 
-__global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S, const int* edgeU, const int* edgeV) {
+__global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S, const float* sumExp, const int* edgeU, const int* edgeV, float t) {
     int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= E) return;
 
@@ -536,28 +642,38 @@ __global__ void fill_lines_vbo(Vertex* outLines, const float* X, const float* S,
     float xi = X[i*3+0], yi = X[i*3+1], zi = X[i*3+2];
     float xj = X[j*3+0], yj = X[j*3+1], zj = X[j*3+2];
 
-    float Rij = safeExp(S[i*N + j]);
-    float a = 1.0f - expf(-EDGE_ALPHA_GAIN * Rij);
-    a = clampf(a, 0.0f, EDGE_ALPHA_MAX);
+    float expSij = safeExp(S[i*N + j]);
+    float pij = expSij / (sumExp[i] + EPS);
+    float pji = expSij / (sumExp[j] + EPS);
+    float w = 0.5f * (pij + pji);
 
-    // Cyan-ish edges
-    float cr = 0.25f;
-    float cg = 0.85f;
-    float cb = 1.00f;
+    float tt = clampf(w * 3.5f, 0.0f, 1.0f);
+
+    float hue = 0.64f - 0.58f * tt;
+    hue += 0.02f * sinf(0.35f * t + 0.013f * (float)e);
+
+    float sat = 0.65f + 0.25f * tt;
+    float val = 0.55f + 0.45f * tt;
+
+    float r, g, b;
+    hsv2rgb(hue, sat, val, r, g, b);
+
+    float alpha = powf(fmaxf(w, 0.0f), 0.60f) * EDGE_ALPHA_GAIN;
+    alpha = clampf(alpha, 0.0f, EDGE_ALPHA_MAX);
 
     Vertex v0, v1;
     v0.px = xi; v0.py = yi; v0.pz = zi;
     v1.px = xj; v1.py = yj; v1.pz = zj;
 
-    v0.cr = cr; v0.cg = cg; v0.cb = cb; v0.ca = a;
-    v1.cr = cr; v1.cg = cg; v1.cb = cb; v1.ca = a;
+    v0.cr = r; v0.cg = g; v0.cb = b; v0.ca = alpha;
+    v1.cr = r; v1.cg = g; v1.cb = b; v1.ca = alpha;
 
     outLines[2*e + 0] = v0;
     outLines[2*e + 1] = v1;
 }
 
 // ============================================================
-// Host helpers: create VBO + VAO for Vertex
+// OpenGL VBO VAO helper
 // ============================================================
 
 static void createVboVao(GLuint& vao, GLuint& vbo, size_t bytes) {
@@ -569,11 +685,9 @@ static void createVboVao(GLuint& vao, GLuint& vbo, size_t bytes) {
 
     glBufferData(GL_ARRAY_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
 
-    // layout(location=0) vec3 pos
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)0);
 
-    // layout(location=1) vec4 color
     glEnableVertexAttribArray(1);
     glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, sizeof(Vertex), (void*)(3 * sizeof(float)));
 
@@ -584,25 +698,7 @@ static void createVboVao(GLuint& vao, GLuint& vbo, size_t bytes) {
 }
 
 // ============================================================
-// Process input for camera movement
-// ============================================================
-
-static void processInput(float dt) {
-    float speed = 4.0f * dt;
-    glm::vec3 right = glm::normalize(glm::cross(cameraFront, cameraUp));
-
-    if (keys[GLFW_KEY_W]) cameraPos += speed * cameraFront;
-    if (keys[GLFW_KEY_S]) cameraPos -= speed * cameraFront;
-    if (keys[GLFW_KEY_A]) cameraPos -= speed * right;
-    if (keys[GLFW_KEY_D]) cameraPos += speed * right;
-    if (keys[GLFW_KEY_Q]) cameraPos -= speed * cameraUp;
-    if (keys[GLFW_KEY_E]) cameraPos += speed * cameraUp;
-}
-
-// ============================================================
-// Effective dimension estimate (CPU) for window title
-// Uses covariance eigenvalues participation ratio in 3D
-// d_eff = (sum λ)^2 / (sum λ^2), ranges 1..3
+// Effective dimension estimate for title
 // ============================================================
 
 static float effectiveDimensionFromPositions(const std::vector<float>& hX) {
@@ -614,7 +710,6 @@ static float effectiveDimensionFromPositions(const std::vector<float>& hX) {
     }
     mean /= (float)N;
 
-    // covariance
     float C[3][3] = {};
     for (int i = 0; i < N; ++i) {
         float x = hX[i*3+0] - mean.x;
@@ -628,8 +723,6 @@ static float effectiveDimensionFromPositions(const std::vector<float>& hX) {
         for (int c = 0; c < 3; ++c)
             C[r][c] /= (float)N;
 
-    // Eigenvalues of 3x3 symmetric matrix (closed form is messy; do power iterations for 3 modes)
-    // For title display only, do simple Jacobi sweeps
     float A[3][3] = {
         {C[0][0], C[0][1], C[0][2]},
         {C[1][0], C[1][1], C[1][2]},
@@ -682,23 +775,18 @@ static float effectiveDimensionFromPositions(const std::vector<float>& hX) {
 }
 
 // ============================================================
-// Reset simulation to deterministic initial conditions
+// Reset simulation
 // ============================================================
 
 static void reset_sim(
     float* dS, float* dSd,
     float* dX, float* dV,
-    float* dB,
     const std::vector<int>& hU,
     const std::vector<int>& hV,
-    int* dU,
-    int* dVedge
+    int* dEdgeU,
+    int* dEdgeV
 ) {
-    // Target degree budget b_i (positive, consistent with R>0)
-    std::vector<float> hB(N, 1.0f);
-    CUDA_CHECK(cudaMemcpy(dB, hB.data(), N*sizeof(float), cudaMemcpyHostToDevice));
-
-    // Deterministic initial geometry: nearly 1D line with tiny deterministic transverse perturbation
+    // Deterministic initial geometry, almost 1D line with tiny deterministic transverse offsets
     std::vector<float> hX(N*3, 0.0f);
     std::vector<float> hVel(N*3, 0.0f);
     for (int i = 0; i < N; ++i) {
@@ -710,32 +798,26 @@ static void reset_sim(
         hX[i*3+1] = y;
         hX[i*3+2] = z;
     }
-    CUDA_CHECK(cudaMemcpy(dX, hX.data(), N*3*sizeof(float), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dV, hVel.data(), N*3*sizeof(float), cudaMemcpyHostToDevice));
 
-    // Deterministic initial relations: uniform log-strength (complete graph)
-    // Start moderate so constraints + geometry decide structure
+    // Initial logits S, uniform off diagonal
     std::vector<float> hS(N*N, S_MIN);
     std::vector<float> hSd(N*N, 0.0f);
 
-    float R0 = 0.05f;               // exp(log(R0))
-    float S0 = logf(R0);
-
+    float S0 = -2.60f;
     for (int i = 0; i < N; ++i) {
         for (int j = 0; j < N; ++j) {
-            if (i == j) {
-                hS[i*N + j] = S_MIN;
-            } else {
-                hS[i*N + j] = S0;
-            }
+            if (i == j) hS[i*N + j] = S_MIN;
+            else        hS[i*N + j] = S0;
         }
     }
 
+    CUDA_CHECK(cudaMemcpy(dX,  hX.data(),  N*3*sizeof(float), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dV,  hVel.data(), N*3*sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dS,  hS.data(),  N*N*sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dSd, hSd.data(), N*N*sizeof(float), cudaMemcpyHostToDevice));
 
-    CUDA_CHECK(cudaMemcpy(dU, hU.data(), E*sizeof(int), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(dVedge, hV.data(), E*sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dEdgeU, hU.data(), E*sizeof(int), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dEdgeV, hV.data(), E*sizeof(int), cudaMemcpyHostToDevice));
 }
 
 // ============================================================
@@ -743,7 +825,6 @@ static void reset_sim(
 // ============================================================
 
 int main() {
-    // GLFW init
     if (!glfwInit()) {
         fprintf(stderr, "Failed to initialize GLFW\n");
         return -1;
@@ -753,21 +834,43 @@ int main() {
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-    GLFWwindow* window = glfwCreateWindow(WIDTH, HEIGHT, "Zero Player Relational Universe", nullptr, nullptr);
+    glfwWindowHint(GLFW_SAMPLES, 4);
+
+    GLFWmonitor* monitor = glfwGetPrimaryMonitor();
+    if (!monitor) {
+        fprintf(stderr, "No primary monitor found\n");
+        glfwTerminate();
+        return -1;
+    }
+    const GLFWvidmode* mode = glfwGetVideoMode(monitor);
+    if (!mode) {
+        fprintf(stderr, "No video mode found\n");
+        glfwTerminate();
+        return -1;
+    }
+
+    gWidth = mode->width;
+    gHeight = mode->height;
+
+    GLFWwindow* window = glfwCreateWindow(gWidth, gHeight, "Meta Relational Universe", monitor, nullptr);
     if (!window) {
         fprintf(stderr, "Failed to create GLFW window\n");
         glfwTerminate();
         return -1;
     }
+
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
+    glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
     glfwSetCursorPosCallback(window, mouse_callback);
     glfwSetScrollCallback(window, scroll_callback);
     glfwSetKeyCallback(window, key_callback);
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
 
-    // GLEW init
+    lastX = gWidth * 0.5f;
+    lastY = gHeight * 0.5f;
+
     glewExperimental = GL_TRUE;
     GLenum glewErr = glewInit();
     if (glewErr != GLEW_OK) {
@@ -775,11 +878,61 @@ int main() {
         return -1;
     }
 
-    // CUDA GL device
+    glViewport(0, 0, gWidth, gHeight);
+
     CUDA_CHECK(cudaGLSetGLDevice(0));
 
     // Shaders
-    const char* vsSrc = R"GLSL(
+    const char* bgVS = R"GLSL(
+        #version 330 core
+        out vec2 vUV;
+        void main() {
+            vec2 pos;
+            if (gl_VertexID == 0) pos = vec2(-1.0, -1.0);
+            if (gl_VertexID == 1) pos = vec2( 3.0, -1.0);
+            if (gl_VertexID == 2) pos = vec2(-1.0,  3.0);
+            vUV = 0.5 * (pos + 1.0);
+            gl_Position = vec4(pos, 0.0, 1.0);
+        }
+    )GLSL";
+
+    const char* bgFS = R"GLSL(
+#version 330 core
+in vec2 vUV;
+out vec4 FragColor;
+
+uniform vec2 uResolution;
+uniform float uTime;
+
+void main() {
+    vec2 uv = gl_FragCoord.xy / uResolution;
+
+    // Vertical gradient
+    vec3 top = vec3(0.06, 0.08, 0.16);
+    vec3 bot = vec3(0.01, 0.01, 0.04);
+    float g = smoothstep(0.0, 1.0, uv.y);
+    vec3 col = mix(bot, top, g);
+
+    // Subtle vignette
+    vec2 q = uv * 2.0 - 1.0;
+    float vignette = 1.0 - 0.22 * dot(q, q);
+    col *= vignette;
+
+    FragColor = vec4(col, 1.0);
+}
+
+    )GLSL";
+
+    GLuint bgV = compileShader(GL_VERTEX_SHADER, bgVS);
+    GLuint bgF = compileShader(GL_FRAGMENT_SHADER, bgFS);
+    GLuint bgProg = linkProgram(bgV, bgF);
+    glDeleteShader(bgV);
+    glDeleteShader(bgF);
+
+    GLint bgRes = glGetUniformLocation(bgProg, "uResolution");
+    GLint bgTime = glGetUniformLocation(bgProg, "uTime");
+
+    const char* vtxSrc = R"GLSL(
         #version 330 core
         layout(location = 0) in vec3 aPos;
         layout(location = 1) in vec4 aColor;
@@ -796,7 +949,7 @@ int main() {
         }
     )GLSL";
 
-    const char* fsSrc = R"GLSL(
+    const char* lineFS = R"GLSL(
         #version 330 core
         in vec4 vColor;
         out vec4 FragColor;
@@ -805,25 +958,48 @@ int main() {
         }
     )GLSL";
 
-    GLuint vs = compileShader(GL_VERTEX_SHADER, vsSrc);
-    GLuint fs = compileShader(GL_FRAGMENT_SHADER, fsSrc);
-    GLuint prog = linkProgram(vs, fs);
-    glDeleteShader(vs);
-    glDeleteShader(fs);
+    const char* pointFS = R"GLSL(
+        #version 330 core
+        in vec4 vColor;
+        out vec4 FragColor;
+        void main() {
+            vec2 p = gl_PointCoord * 2.0 - 1.0;
+            float r2 = dot(p, p);
+            if (r2 > 1.0) discard;
 
-    GLint uMVP = glGetUniformLocation(prog, "uMVP");
-    GLint uPointSize = glGetUniformLocation(prog, "uPointSize");
+            float glow = exp(-3.0 * r2);
+            vec3 col = vColor.rgb * (0.28 + 0.92 * glow);
+            float a = vColor.a * (0.20 + 0.80 * glow);
+
+            FragColor = vec4(col, a);
+        }
+    )GLSL";
+
+    GLuint vtx = compileShader(GL_VERTEX_SHADER, vtxSrc);
+    GLuint lfs = compileShader(GL_FRAGMENT_SHADER, lineFS);
+    GLuint pfs = compileShader(GL_FRAGMENT_SHADER, pointFS);
+
+    GLuint lineProg = linkProgram(vtx, lfs);
+    GLuint pointProg = linkProgram(vtx, pfs);
+
+    glDeleteShader(vtx);
+    glDeleteShader(lfs);
+    glDeleteShader(pfs);
+
+    GLint uMVP_line = glGetUniformLocation(lineProg, "uMVP");
+    GLint uMVP_point = glGetUniformLocation(pointProg, "uMVP");
+    GLint uPointSize = glGetUniformLocation(pointProg, "uPointSize");
 
     // GL state
+    glEnable(GL_MULTISAMPLE);
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glClearColor(0.03f, 0.03f, 0.06f, 1.0f);
 
-    // Create VBO/VAO for points and lines
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+    // Create VBOs
     GLuint vaoPts, vboPts;
     GLuint vaoLines, vboLines;
-
     createVboVao(vaoPts, vboPts, sizeof(Vertex) * (size_t)N);
     createVboVao(vaoLines, vboLines, sizeof(Vertex) * (size_t)(2 * E));
 
@@ -831,43 +1007,49 @@ int main() {
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&cudaVboPoints, vboPts, cudaGraphicsRegisterFlagsWriteDiscard));
     CUDA_CHECK(cudaGraphicsGLRegisterBuffer(&cudaVboLines,  vboLines, cudaGraphicsRegisterFlagsWriteDiscard));
 
-    // Build fixed edge list i<j
+    // Edge list
     std::vector<int> hU(E), hV(E);
-    int idx = 0;
+    int eidx = 0;
     for (int i = 0; i < N; ++i) {
         for (int j = i + 1; j < N; ++j) {
-            hU[idx] = i;
-            hV[idx] = j;
-            idx++;
+            hU[eidx] = i;
+            hV[eidx] = j;
+            eidx++;
         }
     }
 
-    // Allocate simulation buffers on GPU
-    float *dS, *dSd, *dX, *dV, *dDeg, *dB, *dFX;
+    // Allocate device buffers
+    float *dS, *dSd, *dX, *dV;
+    float *dSumExp, *dSumTarget;
+    float *dAction, *dEntropy;
+    float *dFX;
     float *dCM, *dSumR2;
     int *dEdgeU, *dEdgeV;
 
-    CUDA_CHECK(cudaMalloc(&dS,    N*N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dSd,   N*N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dX,    N*3*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dV,    N*3*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dDeg,  N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dB,    N*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dFX,   N*3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dS,        N*N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSd,       N*N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dX,        N*3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dV,        N*3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSumExp,   N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSumTarget,N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dAction,   N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dEntropy,  N*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dFX,       N*3*sizeof(float)));
 
-    CUDA_CHECK(cudaMalloc(&dCM,    3*sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&dSumR2, 1*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dCM,       3*sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&dSumR2,    1*sizeof(float)));
 
-    CUDA_CHECK(cudaMalloc(&dEdgeU, E*sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&dEdgeV, E*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dEdgeU,    E*sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&dEdgeV,    E*sizeof(int)));
 
-    reset_sim(dS, dSd, dX, dV, dB, hU, hV, dEdgeU, dEdgeV);
+    reset_sim(dS, dSd, dX, dV, hU, hV, dEdgeU, dEdgeV);
 
-    // CPU scratch for dimension estimate
     std::vector<float> hX(N*3, 0.0f);
     double titleAccum = 0.0;
 
-    // Main loop
+    GLuint bgVAO = 0;
+    glGenVertexArrays(1, &bgVAO);
+
     while (!glfwWindowShouldClose(window)) {
         float currentFrame = (float)glfwGetTime();
         deltaTime = currentFrame - lastFrame;
@@ -877,28 +1059,47 @@ int main() {
         processInput(deltaTime);
 
         if (keys[GLFW_KEY_R]) {
-            reset_sim(dS, dSd, dX, dV, dB, hU, hV, dEdgeU, dEdgeV);
+            reset_sim(dS, dSd, dX, dV, hU, hV, dEdgeU, dEdgeV);
             keys[GLFW_KEY_R] = false;
         }
 
-        // Physics update (multiple substeps if frame time is large)
         if (!paused) {
             int substeps = (int)fminf(8.0f, fmaxf(1.0f, deltaTime / DT));
             for (int s = 0; s < substeps; ++s) {
-                compute_degree<<<1, 128>>>(dS, dDeg);
-                zero_forces<<<1, 256>>>(dFX);
+                compute_row_sum_exp<<<1, 128>>>(dS, dSumExp);
+                compute_row_sum_target<<<1, 128>>>(dS, dX, dSumExp, dSumTarget);
 
-                edge_forces_and_update_S<<<(E + 255)/256, 256>>>(
-                    dS, dSd, dX, dDeg, dB, dEdgeU, dEdgeV, dFX
+                zero_array<<<1, 256>>>(dFX, N*3);
+                zero_array<<<1, 128>>>(dAction, N);
+
+                meta_update_and_forces<<<(E + 255)/256, 256>>>(
+                    dS, dSd, dX, dFX, dSumExp, dSumTarget, dAction, dEdgeU, dEdgeV
                 );
 
                 reduce_cm_r2<<<1, 256>>>(dX, dCM, dSumR2);
-
                 integrate_X<<<1, 128>>>(dX, dV, dFX, dCM, dSumR2);
             }
         }
 
-        // Map VBOs and fill them directly from CUDA
+        // Stats for render
+        compute_row_sum_exp<<<1, 128>>>(dS, dSumExp);
+        compute_entropy<<<1, 128>>>(dS, dSumExp, dEntropy);
+
+        // Update title periodically
+        titleAccum += (double)deltaTime;
+        if (titleAccum > 0.25) {
+            titleAccum = 0.0;
+            CUDA_CHECK(cudaMemcpy(hX.data(), dX, N*3*sizeof(float), cudaMemcpyDeviceToHost));
+            float deff = effectiveDimensionFromPositions(hX);
+
+            std::ostringstream oss;
+            oss.setf(std::ios::fixed);
+            oss.precision(2);
+            oss << "Meta Relational Universe | d_eff " << deff << (paused ? " | PAUSED" : "");
+            glfwSetWindowTitle(window, oss.str().c_str());
+        }
+
+        // Map VBOs and fill with CUDA
         CUDA_CHECK(cudaGraphicsMapResources(1, &cudaVboPoints, 0));
         CUDA_CHECK(cudaGraphicsMapResources(1, &cudaVboLines,  0));
 
@@ -909,51 +1110,59 @@ int main() {
         CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&dPts, &ptsBytes, cudaVboPoints));
         CUDA_CHECK(cudaGraphicsResourceGetMappedPointer((void**)&dLines, &linesBytes, cudaVboLines));
 
-        fill_points_vbo<<<1, 128>>>(dPts, dX, dDeg, dB);
-        fill_lines_vbo<<<(E + 255)/256, 256>>>(dLines, dX, dS, dEdgeU, dEdgeV);
+        float t = (float)glfwGetTime();
+
+        fill_points_vbo<<<1, 128>>>(dPts, dX, dAction, dEntropy, t);
+        fill_lines_vbo<<<(E + 255)/256, 256>>>(dLines, dX, dS, dSumExp, dEdgeU, dEdgeV, t);
 
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVboPoints, 0));
         CUDA_CHECK(cudaGraphicsUnmapResources(1, &cudaVboLines,  0));
 
-        // Optional: update title with effective dimension estimate (tiny host copy)
-        titleAccum += (double)deltaTime;
-        if (titleAccum > 0.25) {
-            titleAccum = 0.0;
-            CUDA_CHECK(cudaMemcpy(hX.data(), dX, N*3*sizeof(float), cudaMemcpyDeviceToHost));
-            float deff = effectiveDimensionFromPositions(hX);
-
-            std::ostringstream oss;
-            oss.setf(std::ios::fixed);
-            oss.precision(2);
-            oss << "Zero Player Relational Universe | d_eff ~ " << deff
-                << (paused ? " | PAUSED" : "");
-            glfwSetWindowTitle(window, oss.str().c_str());
-        }
-
         // Render
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-        glUseProgram(prog);
 
-        glm::mat4 proj = glm::perspective(glm::radians(fov), (float)WIDTH/(float)HEIGHT, 0.05f, 200.0f);
+        // Background
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+
+        glUseProgram(bgProg);
+        glUniform2f(bgRes, (float)gWidth, (float)gHeight);
+        glUniform1f(bgTime, (float)glfwGetTime());
+        glBindVertexArray(bgVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glBindVertexArray(0);
+
+        glEnable(GL_BLEND);
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+
+        // Matrices
+        glm::mat4 proj = glm::perspective(glm::radians(fov), (float)gWidth/(float)gHeight, 0.05f, 250.0f);
         glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
         glm::mat4 mvp  = proj * view;
 
-        glUniformMatrix4fv(uMVP, 1, GL_FALSE, glm::value_ptr(mvp));
+        // Lines
+        glUseProgram(lineProg);
+        glUniformMatrix4fv(uMVP_line, 1, GL_FALSE, glm::value_ptr(mvp));
 
-        // Draw lines with additive blend for glow-ish feel
         glBlendFunc(GL_SRC_ALPHA, GL_ONE);
-        glUniform1f(uPointSize, 1.0f);
+        glDepthMask(GL_FALSE);
 
         glBindVertexArray(vaoLines);
         glDrawArrays(GL_LINES, 0, 2 * E);
+        glBindVertexArray(0);
 
-        // Draw points
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-        glUniform1f(uPointSize, 7.0f);
+        // Points
+        glUseProgram(pointProg);
+        glUniformMatrix4fv(uMVP_point, 1, GL_FALSE, glm::value_ptr(mvp));
+        glUniform1f(uPointSize, 11.0f);
+
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+        glDepthMask(GL_TRUE);
 
         glBindVertexArray(vaoPts);
         glDrawArrays(GL_POINTS, 0, N);
-
         glBindVertexArray(0);
 
         glfwSwapBuffers(window);
@@ -963,18 +1172,25 @@ int main() {
     CUDA_CHECK(cudaGraphicsUnregisterResource(cudaVboPoints));
     CUDA_CHECK(cudaGraphicsUnregisterResource(cudaVboLines));
 
+    glDeleteVertexArrays(1, &bgVAO);
+
     glDeleteBuffers(1, &vboPts);
     glDeleteVertexArrays(1, &vaoPts);
     glDeleteBuffers(1, &vboLines);
     glDeleteVertexArrays(1, &vaoLines);
-    glDeleteProgram(prog);
+
+    glDeleteProgram(bgProg);
+    glDeleteProgram(lineProg);
+    glDeleteProgram(pointProg);
 
     CUDA_CHECK(cudaFree(dS));
     CUDA_CHECK(cudaFree(dSd));
     CUDA_CHECK(cudaFree(dX));
     CUDA_CHECK(cudaFree(dV));
-    CUDA_CHECK(cudaFree(dDeg));
-    CUDA_CHECK(cudaFree(dB));
+    CUDA_CHECK(cudaFree(dSumExp));
+    CUDA_CHECK(cudaFree(dSumTarget));
+    CUDA_CHECK(cudaFree(dAction));
+    CUDA_CHECK(cudaFree(dEntropy));
     CUDA_CHECK(cudaFree(dFX));
     CUDA_CHECK(cudaFree(dCM));
     CUDA_CHECK(cudaFree(dSumR2));
