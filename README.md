@@ -12,5 +12,4 @@ to compile and run:
 
 3. ./zero-player-meta-relational-least-principle-action.cu
 
-video is in 480p due to github's constrains of 10mb sized videos
-
+video is in 480p and has a 15s duration due to github's constrains of 10mb sized videos.
