@@ -23,3 +23,6 @@ video is in 480p and has a 15s duration due to github's constrains of 10mb sized
 # interesting aspects
 
 - it starts at 1d, goes to 2d and then lands on 3d
+- awsd and mouse camera
+- scroll for zoom in and out
+- q and e for up and down movement
